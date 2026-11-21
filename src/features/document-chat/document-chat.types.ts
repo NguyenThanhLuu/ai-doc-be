@@ -26,9 +26,7 @@ export interface ChatHistoryMessage {
   content: string;
 }
 
-export type ChatCommandResult =
-  | { ok: true }
-  | { ok: false; error: ChatError };
+export type ChatCommandResult = { ok: true } | { ok: false; error: ChatError };
 
 export type ChatAcknowledge = (result: ChatCommandResult) => void;
 
@@ -73,7 +71,7 @@ export interface ActiveChatResponse {
 
 export interface DocumentChatSocketData {
   documentId: string | null;
-  documentChunks: readonly DocumentChunk[] | null;
+  documentChunks: DocumentChunk[] | null;
   activeResponse: ActiveChatResponse | null;
   history: ChatHistoryMessage[];
 }

@@ -260,13 +260,13 @@ async function embedPdfTextChunks(
 
 export async function createPdfDocumentIndex(
   pdfContent: Buffer,
-): Promise<readonly DocumentChunk[]> {
+): Promise<DocumentChunk[]> {
   const textChunks = await extractPdfTextChunks(pdfContent);
   return embedPdfTextChunks(textChunks);
 }
 
 interface RetrieveDocumentEvidenceInput {
-  chunks: readonly DocumentChunk[];
+  chunks: DocumentChunk[];
   question: string;
   signal: AbortSignal;
 }

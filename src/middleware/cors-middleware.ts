@@ -7,7 +7,8 @@ export const corsMiddleware: RequestHandler = (request, response, next) => {
   if (requestOrigin === FRONTEND_ORIGIN) {
     response.vary("Origin");
     response.set({
-      "Access-Control-Allow-Headers": "Accept, Content-Type",
+      "Access-Control-Allow-Credentials": "true",
+      "Access-Control-Allow-Headers": "Accept, Authorization, Content-Type",
       "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
       "Access-Control-Allow-Origin": FRONTEND_ORIGIN,
     });

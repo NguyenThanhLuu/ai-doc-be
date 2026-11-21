@@ -1,32 +1,32 @@
 export interface DocumentMetadata {
-  readonly id: string;
-  readonly name: string;
-  readonly originalFileName: string;
-  readonly mimeType: "application/pdf";
-  readonly size: number;
-  readonly createdAt: string;
+  id: string;
+  name: string;
+  originalFileName: string;
+  mimeType: "application/pdf";
+  size: number;
+  createdAt: string;
 }
 
 export interface DocumentChunk {
-  readonly pageNumber: number;
-  readonly text: string;
-  readonly embedding: readonly number[];
+  pageNumber: number;
+  text: string;
+  embedding: number[];
 }
 
 export interface DocumentEvidence {
-  readonly pageNumber: number;
-  readonly text: string;
+  pageNumber: number;
+  text: string;
 }
 
 export interface StoredDocument extends DocumentMetadata {
-  readonly content: Buffer;
-  readonly chunks: readonly DocumentChunk[];
+  content: Buffer;
+  chunks: DocumentChunk[];
 }
 
 export interface CreateStoredDocumentInput {
-  readonly name: string;
-  readonly originalFileName: string;
-  readonly size: number;
-  readonly content: Buffer;
-  readonly chunks: readonly DocumentChunk[];
+  name: string;
+  originalFileName: string;
+  size: number;
+  content: Buffer;
+  chunks: DocumentChunk[];
 }

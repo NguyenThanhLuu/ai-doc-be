@@ -3,7 +3,7 @@ import type { Server as HttpServer } from "node:http";
 import { Server, type Socket } from "socket.io";
 import { FRONTEND_ORIGIN } from "../../config/environment.js";
 import { retrieveDocumentEvidence } from "../documents/document-indexing.js";
-import { findDocument } from "../documents/document.store.js";
+import type { DocumentRepository } from "../documents/document.repository.js";
 import type { DocumentChunk } from "../documents/document.types.js";
 import {
   mapGeminiError,
@@ -89,7 +89,7 @@ function stopActiveResponse(socket: DocumentChatSocket): void {
 async function streamGeminiAssistantResponse(
   socket: DocumentChatSocket,
   userContent: string,
-  documentChunks: readonly DocumentChunk[],
+  documentChunks: DocumentChunk[],
 ): Promise<void> {
   const assistantMessageId = randomUUID();
   const createdAt = new Date().toISOString();
@@ -181,7 +181,10 @@ async function streamGeminiAssistantResponse(
   }
 }
 
-export function attachDocumentChatSocket(httpServer: HttpServer): void {
+export function attachDocumentChatSocket(
+  httpServer: HttpServer,
+  documentRepository: DocumentRepository,
+): void {
   const io: DocumentChatServer = new Server(httpServer, {
     cors: {
       origin: FRONTEND_ORIGIN,
@@ -195,7 +198,7 @@ export function attachDocumentChatSocket(httpServer: HttpServer): void {
     socket.data.activeResponse = null;
     socket.data.history = [];
 
-    socket.on("chat:session:create", (payload, acknowledge) => {
+    socket.on("chat:session:create", async (payload, acknowledge) => {
       const documentId = readDocumentId(payload);
 
       if (documentId === null) {
@@ -209,7 +212,7 @@ export function attachDocumentChatSocket(httpServer: HttpServer): void {
         return;
       }
 
-      const document = findDocument(documentId);
+      const document = await documentRepository.findById(documentId);
 
       if (!document) {
         acknowledge({
