@@ -3,36 +3,45 @@ import {
   Controller,
   Get,
   Header,
+  HttpCode,
   HttpStatus,
   Inject,
   Param,
   Post,
-  StreamableFile,
+  Res,
   UploadedFile,
   UseInterceptors,
 } from "@nestjs/common";
 import { FileInterceptor } from "@nestjs/platform-express";
+import type { Response } from "express";
 import multer from "multer";
 import { ApiHttpException } from "../../http/api-http.exception.js";
+import { CurrentUser } from "../authentication/current-user.decorator.js";
+import type { AuthenticatedPrincipal } from "../authentication/authentication.types.js";
 import {
   documentIdSchema,
   documentUploadSchema,
   MAX_PDF_SIZE_BYTES,
 } from "./document.schema.js";
-import type { DocumentMetadata, StoredDocument } from "./document.types.js";
+import type { DocumentMetadata, DocumentRecord } from "./document.types.js";
 import { DocumentsService } from "./documents.service.js";
 
 interface CreateDocumentResponse {
-  document: DocumentMetadata;
-  message: string;
+  readonly document: DocumentMetadata;
+  readonly message: string;
 }
 
 interface DocumentMetadataResponse {
-  document: DocumentMetadata;
+  readonly document: DocumentMetadata;
 }
 
 interface DocumentListResponse {
-  documents: readonly DocumentMetadata[];
+  readonly documents: readonly DocumentMetadata[];
+}
+
+interface DocumentContentUrlResponse {
+  readonly expiresAt: string;
+  readonly url: string;
 }
 
 function readBodyField(body: unknown, fieldName: string): unknown {
@@ -43,6 +52,19 @@ function readBodyField(body: unknown, fieldName: string): unknown {
   return Reflect.get(body, fieldName);
 }
 
+function toMetadata(document: DocumentRecord): DocumentMetadata {
+  return {
+    id: document.id,
+    name: document.name,
+    originalFileName: document.originalFileName,
+    mimeType: document.mimeType,
+    size: document.size,
+    indexingStatus: document.indexingStatus,
+    indexingError: document.indexingError,
+    createdAt: document.createdAt,
+  };
+}
+
 @Controller("api/documents")
 export class DocumentsController {
   constructor(
@@ -51,6 +73,7 @@ export class DocumentsController {
   ) {}
 
   @Post()
+  @HttpCode(HttpStatus.ACCEPTED)
   @UseInterceptors(
     FileInterceptor("file", {
       storage: multer.memoryStorage(),
@@ -63,8 +86,10 @@ export class DocumentsController {
   async create(
     @Body() body: unknown,
     @UploadedFile() file: Express.Multer.File | undefined,
+    @CurrentUser() currentUser: AuthenticatedPrincipal,
   ): Promise<CreateDocumentResponse> {
     const validationResult = documentUploadSchema.safeParse({
+      uploadRequestId: readBodyField(body, "uploadRequestId"),
       name: readBodyField(body, "name"),
       file,
     });
@@ -78,54 +103,92 @@ export class DocumentsController {
       );
     }
 
-    const document = await this.documentsService.create(validationResult.data);
+    const document = await this.documentsService.create({
+      ...validationResult.data,
+      userId: currentUser.id,
+    });
 
     return {
-      message: "Document added and indexed successfully.",
+      message:
+        "PDF uploaded successfully. AI indexing is running in the background.",
       document,
     };
   }
 
   @Get()
-  async list(): Promise<DocumentListResponse> {
-    return { documents: await this.documentsService.list() };
+  @Header("Cache-Control", "no-store")
+  async list(
+    @CurrentUser() currentUser: AuthenticatedPrincipal,
+  ): Promise<DocumentListResponse> {
+    return { documents: await this.documentsService.list(currentUser.id) };
+  }
+
+  @Get(":documentId/content-url")
+  @Header("Cache-Control", "no-store")
+  async getContentUrl(
+    @Param("documentId") documentId: string,
+    @CurrentUser() currentUser: AuthenticatedPrincipal,
+  ): Promise<DocumentContentUrlResponse> {
+    const document = await this.findValidatedDocument(
+      documentId,
+      currentUser.id,
+    );
+    return this.documentsService.createSignedContentUrl(document);
   }
 
   @Get(":documentId/content")
   @Header("Cache-Control", "no-store")
-  async getContent(
+  async redirectToContent(
     @Param("documentId") documentId: string,
-  ): Promise<StreamableFile> {
-    const document = await this.findValidatedDocument(documentId);
+    @CurrentUser() currentUser: AuthenticatedPrincipal,
+    @Res() response: Response,
+  ): Promise<void> {
+    const document = await this.findValidatedDocument(
+      documentId,
+      currentUser.id,
+    );
+    const contentUrl =
+      await this.documentsService.createSignedContentUrl(document);
 
-    return new StreamableFile(document.content, {
-      type: document.mimeType,
-      disposition: `inline; filename*=UTF-8''${encodeURIComponent(document.originalFileName)}`,
-      length: document.size,
-    });
+    response.redirect(HttpStatus.TEMPORARY_REDIRECT, contentUrl.url);
+  }
+
+  @Post(":documentId/indexing/retry")
+  @HttpCode(HttpStatus.ACCEPTED)
+  async retryIndexing(
+    @Param("documentId") documentId: string,
+    @CurrentUser() currentUser: AuthenticatedPrincipal,
+  ): Promise<CreateDocumentResponse> {
+    const document = await this.findValidatedDocument(
+      documentId,
+      currentUser.id,
+    );
+    const retriedDocument = await this.documentsService.retryIndexing(document);
+
+    return {
+      message: "Document indexing was queued again.",
+      document: retriedDocument,
+    };
   }
 
   @Get(":documentId")
+  @Header("Cache-Control", "no-store")
   async getOne(
     @Param("documentId") documentId: string,
+    @CurrentUser() currentUser: AuthenticatedPrincipal,
   ): Promise<DocumentMetadataResponse> {
-    const document = await this.findValidatedDocument(documentId);
+    const document = await this.findValidatedDocument(
+      documentId,
+      currentUser.id,
+    );
 
-    return {
-      document: {
-        id: document.id,
-        name: document.name,
-        originalFileName: document.originalFileName,
-        mimeType: document.mimeType,
-        size: document.size,
-        createdAt: document.createdAt,
-      },
-    };
+    return { document: toMetadata(document) };
   }
 
   private async findValidatedDocument(
     documentId: string,
-  ): Promise<StoredDocument> {
+    userId: string,
+  ): Promise<DocumentRecord> {
     const idResult = documentIdSchema.safeParse(documentId);
 
     if (!idResult.success) {
@@ -136,7 +199,10 @@ export class DocumentsController {
       );
     }
 
-    const document = await this.documentsService.findById(idResult.data);
+    const document = await this.documentsService.findById(
+      idResult.data,
+      userId,
+    );
 
     if (!document) {
       throw new ApiHttpException(

@@ -14,23 +14,18 @@ import { ApiHttpException } from "../../http/api-http.exception.js";
 import { readCookie } from "../../http/request-credentials.js";
 import { loginSchema } from "./authentication.schema.js";
 import {
-  AuthenticationService,
   REFRESH_TOKEN_COOKIE_NAME,
+  REFRESH_TOKEN_COOKIE_OPTIONS,
   REFRESH_TOKEN_DURATION_MS,
-} from "./authentication.service.js";
+} from "./authentication.cookie.js";
+import { AuthenticationService } from "./authentication.service.js";
 import type { AuthenticatedUser } from "./authentication.types.js";
+import { Public } from "./public.decorator.js";
 
 interface AuthenticationResponse {
   readonly user: AuthenticatedUser;
   readonly accessToken: string;
 }
-
-const COOKIE_OPTIONS = {
-  httpOnly: true,
-  sameSite: "lax",
-  secure: process.env.NODE_ENV === "production",
-  path: "/api/auth",
-} as const;
 
 @Controller("api/auth")
 export class AuthenticationController {
@@ -40,6 +35,7 @@ export class AuthenticationController {
   ) {}
 
   @Post("login")
+  @Public()
   @HttpCode(HttpStatus.OK)
   @Header("Cache-Control", "no-store")
   async login(
@@ -61,7 +57,7 @@ export class AuthenticationController {
       validationResult.data,
     );
     response.cookie(REFRESH_TOKEN_COOKIE_NAME, loginResult.refreshToken, {
-      ...COOKIE_OPTIONS,
+      ...REFRESH_TOKEN_COOKIE_OPTIONS,
       maxAge: REFRESH_TOKEN_DURATION_MS,
     });
 
@@ -72,6 +68,7 @@ export class AuthenticationController {
   }
 
   @Post("refresh")
+  @Public()
   @HttpCode(HttpStatus.OK)
   @Header("Cache-Control", "no-store")
   async refresh(
@@ -83,15 +80,22 @@ export class AuthenticationController {
         readCookie(request, REFRESH_TOKEN_COOKIE_NAME),
       );
     } catch (error: unknown) {
-      response.clearCookie(REFRESH_TOKEN_COOKIE_NAME, COOKIE_OPTIONS);
+      response.clearCookie(
+        REFRESH_TOKEN_COOKIE_NAME,
+        REFRESH_TOKEN_COOKIE_OPTIONS,
+      );
       throw error;
     }
   }
 
   @Post("logout")
+  @Public()
   @HttpCode(HttpStatus.NO_CONTENT)
   @Header("Cache-Control", "no-store")
   async logout(@Res({ passthrough: true }) response: Response): Promise<void> {
-    response.clearCookie(REFRESH_TOKEN_COOKIE_NAME, COOKIE_OPTIONS);
+    response.clearCookie(
+      REFRESH_TOKEN_COOKIE_NAME,
+      REFRESH_TOKEN_COOKIE_OPTIONS,
+    );
   }
 }

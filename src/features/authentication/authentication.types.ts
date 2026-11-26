@@ -7,6 +7,10 @@ export interface AuthenticatedUser {
   readonly role: UserRole;
 }
 
+export interface AuthenticatedPrincipal extends AuthenticatedUser {
+  readonly accessTokenExpiresAt: number;
+}
+
 export interface StoredUser extends AuthenticatedUser {
   readonly passwordHash: string;
 }

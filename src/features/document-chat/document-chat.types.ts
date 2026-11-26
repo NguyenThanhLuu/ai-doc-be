@@ -1,5 +1,3 @@
-import type { DocumentChunk } from "../documents/document.types.js";
-
 export type ChatMessageRole = "user" | "assistant";
 export type ChatMessageStatus =
   | "pending"
@@ -70,8 +68,8 @@ export interface ActiveChatResponse {
 }
 
 export interface DocumentChatSocketData {
+  userId: string;
   documentId: string | null;
-  documentChunks: DocumentChunk[] | null;
   activeResponse: ActiveChatResponse | null;
   history: ChatHistoryMessage[];
 }

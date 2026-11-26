@@ -1,14 +1,11 @@
 import { Buffer } from "node:buffer";
 import { z } from "zod";
-
-const MAX_PASSWORD_BYTES = 72;
+import { MAX_PASSWORD_BYTES } from "./authentication.password.js";
 
 const emailSchema = z
   .string({ error: "Email is required." })
-  .trim()
   .email("Enter a valid email address.")
-  .max(254, "Email must contain 254 characters or fewer.")
-  .transform((email) => email.toLowerCase());
+  .max(254, "Email must contain 254 characters or fewer.");
 
 export const loginSchema = z.object({
   email: emailSchema,

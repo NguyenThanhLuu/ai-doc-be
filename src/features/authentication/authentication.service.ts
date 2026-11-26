@@ -1,6 +1,5 @@
 import { randomBytes } from "node:crypto";
 import { HttpStatus, Inject, Injectable } from "@nestjs/common";
-import bcrypt from "bcrypt";
 import { SignJWT, jwtVerify } from "jose";
 import {
   ACCESS_TOKEN_SECRET,
@@ -8,24 +7,25 @@ import {
 } from "../../config/environment.js";
 import { ApiHttpException } from "../../http/api-http.exception.js";
 import { AuthenticationRepository } from "./authentication.repository.js";
+import { REFRESH_TOKEN_DURATION_SECONDS } from "./authentication.cookie.js";
+import {
+  hashPassword,
+  verifyPassword,
+} from "./authentication.password.js";
 import type { LoginInput } from "./authentication.schema.js";
-import type { AuthenticatedUser } from "./authentication.types.js";
+import type {
+  AuthenticatedPrincipal,
+  AuthenticatedUser,
+} from "./authentication.types.js";
 
-const BCRYPT_WORK_FACTOR = 12;
 const ACCESS_TOKEN_DURATION_SECONDS = 60 * 60;
-const REFRESH_TOKEN_DURATION_SECONDS = 7 * 24 * 60 * 60;
-const INVALID_PASSWORD_HASH_PROMISE = bcrypt.hash(
+const INVALID_PASSWORD_HASH_PROMISE = hashPassword(
   randomBytes(32).toString("base64url"),
-  BCRYPT_WORK_FACTOR,
 );
 
 const JWT_ALGORITHM = "HS256";
 const JWT_ISSUER = "ai-doc-api";
 const JWT_AUDIENCE = "ai-doc-web";
-
-export const REFRESH_TOKEN_COOKIE_NAME = "ai_doc_refresh_token";
-export const REFRESH_TOKEN_DURATION_MS =
-  REFRESH_TOKEN_DURATION_SECONDS * 1_000;
 
 export interface LoginResult {
   readonly user: AuthenticatedUser;
@@ -51,7 +51,7 @@ export class AuthenticationService {
     );
     const passwordHash =
       user?.passwordHash ?? (await INVALID_PASSWORD_HASH_PROMISE);
-    const hasMatchingPassword = await bcrypt.compare(
+    const hasMatchingPassword = await verifyPassword(
       input.password,
       passwordHash,
     );
@@ -68,7 +68,7 @@ export class AuthenticationService {
 
     return {
       user: authenticatedUser,
-      accessToken: await this.createAccessToken(authenticatedUser),
+      accessToken: await this.issueAccessToken(authenticatedUser),
       refreshToken: await this.createRefreshToken(authenticatedUser.id),
     };
   }
@@ -87,11 +87,13 @@ export class AuthenticationService {
 
     return {
       user,
-      accessToken: await this.createAccessToken(user),
+      accessToken: await this.issueAccessToken(user),
     };
   }
 
-  async getCurrentUser(accessToken: string | null): Promise<AuthenticatedUser> {
+  async getCurrentUser(
+    accessToken: string | null,
+  ): Promise<AuthenticatedPrincipal> {
     if (accessToken === null) {
       throw this.createAuthenticationRequiredError();
     }
@@ -108,6 +110,7 @@ export class AuthenticationService {
         typeof payload.sub !== "string" ||
         typeof payload.username !== "string" ||
         typeof payload.email !== "string" ||
+        typeof payload.exp !== "number" ||
         (payload.role !== "admin" && payload.role !== "user")
       ) {
         throw this.createAuthenticationRequiredError();
@@ -118,13 +121,31 @@ export class AuthenticationService {
         username: payload.username,
         email: payload.email,
         role: payload.role,
+        accessTokenExpiresAt: payload.exp,
       };
     } catch {
       throw this.createAuthenticationRequiredError();
     }
   }
 
-  private createAccessToken(user: AuthenticatedUser): Promise<string> {
+  issueAccessToken(user: AuthenticatedUser): Promise<string> {
+    return this.createAccessToken(
+      user,
+      `${ACCESS_TOKEN_DURATION_SECONDS}s`,
+    );
+  }
+
+  issueReplacementAccessToken(
+    user: AuthenticatedUser,
+    accessTokenExpiresAt: number,
+  ): Promise<string> {
+    return this.createAccessToken(user, accessTokenExpiresAt);
+  }
+
+  private createAccessToken(
+    user: AuthenticatedUser,
+    expirationTime: string | number,
+  ): Promise<string> {
     return new SignJWT({
       tokenType: "access",
       username: user.username,
@@ -136,7 +157,7 @@ export class AuthenticationService {
       .setIssuer(JWT_ISSUER)
       .setAudience(JWT_AUDIENCE)
       .setIssuedAt()
-      .setExpirationTime(`${ACCESS_TOKEN_DURATION_SECONDS}s`)
+      .setExpirationTime(expirationTime)
       .sign(ACCESS_TOKEN_SECRET);
   }
 

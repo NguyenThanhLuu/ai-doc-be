@@ -1,20 +1,14 @@
-import { GoogleGenAI } from "@google/genai";
 import { getDocument } from "pdfjs-dist/legacy/build/pdf.mjs";
-import {
-  GEMINI_API_KEY,
-  GEMINI_EMBEDDING_MODEL,
-} from "../../config/environment.js";
-import type { DocumentChunk, DocumentEvidence } from "./document.types.js";
+import type { AiService } from "../../ai/ai.service.js";
+import type { DocumentChunk } from "./document.types.js";
 
 const CHUNK_LENGTH_CHARACTERS = 1_200;
 const CHUNK_OVERLAP_CHARACTERS = 200;
 const EMBEDDING_BATCH_SIZE = 50;
 const EMBEDDING_DIMENSIONS = 768;
+const EMBEDDING_REQUEST_TIMEOUT_MILLISECONDS = 60_000;
 const MAX_DOCUMENT_CHUNKS = 500;
 const MIN_EXTRACTED_TEXT_CHARACTERS = 50;
-const MAX_RETRIEVED_CHUNKS = 4;
-
-const geminiClient = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
 
 interface PdfTextChunk {
   pageNumber: number;
@@ -158,32 +152,9 @@ function normalizeEmbedding(values: readonly number[]): number[] {
   return values.map((value) => value / magnitude);
 }
 
-function calculateCosineSimilarity(
-  left: readonly number[],
-  right: readonly number[],
-): number | null {
-  if (left.length !== right.length) {
-    return null;
-  }
-
-  let similarity = 0;
-
-  for (let index = 0; index < left.length; index += 1) {
-    const leftValue = left[index];
-    const rightValue = right[index];
-
-    if (leftValue === undefined || rightValue === undefined) {
-      return null;
-    }
-
-    similarity += leftValue * rightValue;
-  }
-
-  return similarity;
-}
-
 async function embedPdfTextChunks(
   textChunks: readonly PdfTextChunk[],
+  aiService: AiService,
 ): Promise<DocumentChunk[]> {
   const documentChunks: DocumentChunk[] = [];
 
@@ -197,15 +168,10 @@ async function embedPdfTextChunks(
         batchStart,
         batchStart + EMBEDDING_BATCH_SIZE,
       );
-      const response = await geminiClient.models.embedContent({
-        model: GEMINI_EMBEDDING_MODEL,
-        contents: chunkBatch.map((chunk) => chunk.text),
-        config: {
-          outputDimensionality: EMBEDDING_DIMENSIONS,
-          taskType: "RETRIEVAL_DOCUMENT",
-        },
-      });
-      const embeddings = response.embeddings ?? [];
+      const embeddings = await aiService.createDocumentEmbeddings(
+        chunkBatch.map((chunk) => chunk.text),
+        AbortSignal.timeout(EMBEDDING_REQUEST_TIMEOUT_MILLISECONDS),
+      );
 
       if (embeddings.length !== chunkBatch.length) {
         throw new DocumentIndexingError(
@@ -214,15 +180,13 @@ async function embedPdfTextChunks(
           502,
         );
       }
-      // embeddings = [{value: [0.234, -0.345]}, {value: [0.345, 0.345]}]
-
       for (
         let batchIndex = 0;
         batchIndex < chunkBatch.length;
         batchIndex += 1
       ) {
         const textChunk = chunkBatch[batchIndex];
-        const embeddingValues = embeddings[batchIndex]?.values;
+        const embeddingValues = embeddings[batchIndex];
 
         if (
           !textChunk ||
@@ -260,56 +224,31 @@ async function embedPdfTextChunks(
 
 export async function createPdfDocumentIndex(
   pdfContent: Buffer,
+  aiService: AiService,
 ): Promise<DocumentChunk[]> {
   const textChunks = await extractPdfTextChunks(pdfContent);
-  return embedPdfTextChunks(textChunks);
+  return embedPdfTextChunks(textChunks, aiService);
 }
 
-interface RetrieveDocumentEvidenceInput {
-  chunks: DocumentChunk[];
+interface CreateQuestionEmbeddingInput {
+  aiService: AiService;
   question: string;
   signal: AbortSignal;
 }
 
-export async function retrieveDocumentEvidence({
-  chunks,
+export async function createQuestionEmbedding({
+  aiService,
   question,
   signal,
-}: RetrieveDocumentEvidenceInput): Promise<readonly DocumentEvidence[]> {
-  if (chunks.length === 0) {
-    return [];
+}: CreateQuestionEmbeddingInput): Promise<number[]> {
+  const embeddingValues = await aiService.createQuestionEmbedding(
+    question,
+    signal,
+  );
+
+  if (embeddingValues.length !== EMBEDDING_DIMENSIONS) {
+    throw new Error("The AI provider returned an invalid question embedding.");
   }
 
-  const response = await geminiClient.models.embedContent({
-    model: GEMINI_EMBEDDING_MODEL,
-    contents: question,
-    config: {
-      abortSignal: signal,
-      outputDimensionality: EMBEDDING_DIMENSIONS,
-      taskType: "QUESTION_ANSWERING",
-    },
-  });
-  const embeddingValues = response.embeddings?.[0]?.values;
-
-  if (!embeddingValues || embeddingValues.length !== EMBEDDING_DIMENSIONS) {
-    throw new Error("Gemini returned an invalid question embedding.");
-  }
-
-  const questionEmbedding = normalizeEmbedding(embeddingValues);
-
-  return chunks
-    .map((chunk) => ({
-      chunk,
-      similarity: calculateCosineSimilarity(questionEmbedding, chunk.embedding),
-    }))
-    .filter(
-      (result): result is { chunk: DocumentChunk; similarity: number } =>
-        result.similarity !== null,
-    )
-    .sort((left, right) => right.similarity - left.similarity)
-    .slice(0, MAX_RETRIEVED_CHUNKS)
-    .map(({ chunk }) => ({
-      pageNumber: chunk.pageNumber,
-      text: chunk.text,
-    }));
+  return normalizeEmbedding(embeddingValues);
 }

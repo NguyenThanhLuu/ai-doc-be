@@ -1,15 +1,13 @@
 import { randomUUID } from "node:crypto";
 import type { Server as HttpServer } from "node:http";
 import { Server, type Socket } from "socket.io";
-import { FRONTEND_ORIGIN } from "../../config/environment.js";
-import { retrieveDocumentEvidence } from "../documents/document-indexing.js";
-import type { DocumentRepository } from "../documents/document.repository.js";
-import type { DocumentChunk } from "../documents/document.types.js";
 import {
-  mapGeminiError,
-  readGeminiErrorStatus,
-  streamGeminiResponse,
-} from "./gemini-generation.js";
+  AiService,
+  type AiProviderErrorCategory,
+} from "../../ai/ai.service.js";
+import type { AuthenticationService } from "../authentication/authentication.service.js";
+import { createQuestionEmbedding } from "../documents/document-indexing.js";
+import type { DocumentRepository } from "../documents/document.repository.js";
 import type {
   ChatError,
   ChatHistoryMessage,
@@ -35,9 +33,35 @@ type DocumentChatSocket = Socket<
 
 const MAX_MESSAGE_LENGTH = 2_000;
 const MAX_HISTORY_TURNS = 5;
+const MAX_RETRIEVED_CHUNKS = 4;
 
 function createError(code: string, message: string): ChatError {
   return { code, message };
+}
+
+function mapAiError(category: AiProviderErrorCategory): ChatError {
+  switch (category) {
+    case "rate_limited":
+      return {
+        code: "RATE_LIMITED",
+        message: "AI is receiving too many requests. Try again shortly.",
+      };
+    case "configuration":
+      return {
+        code: "PROVIDER_CONFIGURATION_ERROR",
+        message: "AI service is not configured correctly.",
+      };
+    case "unavailable":
+      return {
+        code: "PROVIDER_UNAVAILABLE",
+        message: "AI service is temporarily unavailable. Try again shortly.",
+      };
+    case "unknown":
+      return {
+        code: "GENERATION_FAILED",
+        message: "The AI response failed. Try again.",
+      };
+  }
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -67,6 +91,14 @@ function readMessageContent(payload: unknown): string | null {
   return content;
 }
 
+function readSocketAccessToken(socket: DocumentChatSocket): string | null {
+  const accessToken = socket.handshake.auth["accessToken"];
+
+  return typeof accessToken === "string" && accessToken.trim() !== ""
+    ? accessToken
+    : null;
+}
+
 function appendCompletedTurn(
   history: readonly ChatHistoryMessage[],
   userContent: string,
@@ -86,11 +118,18 @@ function stopActiveResponse(socket: DocumentChatSocket): void {
   socket.data.activeResponse = null;
 }
 
-async function streamGeminiAssistantResponse(
+async function streamAssistantResponse(
   socket: DocumentChatSocket,
+  documentRepository: DocumentRepository,
+  aiService: AiService,
   userContent: string,
-  documentChunks: DocumentChunk[],
 ): Promise<void> {
+  const documentId = socket.data.documentId;
+
+  if (documentId === null) {
+    return;
+  }
+
   const assistantMessageId = randomUUID();
   const createdAt = new Date().toISOString();
   const controller = new AbortController();
@@ -108,13 +147,19 @@ async function streamGeminiAssistantResponse(
   });
 
   try {
-    const evidence = await retrieveDocumentEvidence({
-      chunks: documentChunks,
+    const questionEmbedding = await createQuestionEmbedding({
+      aiService,
       question: userContent,
       signal: controller.signal,
     });
+    const evidence = await documentRepository.findRelevantEvidence(
+      documentId,
+      socket.data.userId,
+      questionEmbedding,
+      MAX_RETRIEVED_CHUNKS,
+    );
 
-    for await (const delta of streamGeminiResponse({
+    for await (const delta of aiService.streamDocumentAnswer({
       evidence,
       history: socket.data.history,
       message: userContent,
@@ -128,7 +173,7 @@ async function streamGeminiAssistantResponse(
     }
 
     if (content.trim() === "") {
-      throw new Error("Gemini returned an empty response.");
+      throw new Error("The AI provider returned an empty response.");
     }
 
     socket.data.history = appendCompletedTurn(
@@ -157,7 +202,8 @@ async function streamGeminiAssistantResponse(
         },
       });
     } else {
-      const chatError = mapGeminiError(error);
+      const providerError = aiService.getProviderErrorDetails(error);
+      const chatError = mapAiError(providerError.category);
 
       socket.emit("chat:assistant:failed", {
         message: {
@@ -169,9 +215,9 @@ async function streamGeminiAssistantResponse(
         },
         error: chatError,
       });
-      console.error("Gemini document chat failed.", {
+      console.error("AI document chat failed.", {
         code: chatError.code,
-        providerStatus: readGeminiErrorStatus(error),
+        providerStatus: providerError.status,
       });
     }
   } finally {
@@ -184,17 +230,31 @@ async function streamGeminiAssistantResponse(
 export function attachDocumentChatSocket(
   httpServer: HttpServer,
   documentRepository: DocumentRepository,
+  authenticationService: AuthenticationService,
+  aiService: AiService,
 ): void {
   const io: DocumentChatServer = new Server(httpServer, {
     cors: {
-      origin: FRONTEND_ORIGIN,
+      origin: true,
+      credentials: true,
       methods: ["GET", "POST"],
     },
   });
 
+  io.use(async (socket, next) => {
+    try {
+      const currentUser = await authenticationService.getCurrentUser(
+        readSocketAccessToken(socket),
+      );
+      socket.data.userId = currentUser.id;
+      next();
+    } catch {
+      next(new Error("AUTHENTICATION_REQUIRED"));
+    }
+  });
+
   io.on("connection", (socket) => {
     socket.data.documentId = null;
-    socket.data.documentChunks = null;
     socket.data.activeResponse = null;
     socket.data.history = [];
 
@@ -212,7 +272,10 @@ export function attachDocumentChatSocket(
         return;
       }
 
-      const document = await documentRepository.findById(documentId);
+      const document = await documentRepository.findByIdForUser(
+        documentId,
+        socket.data.userId,
+      );
 
       if (!document) {
         acknowledge({
@@ -225,9 +288,19 @@ export function attachDocumentChatSocket(
         return;
       }
 
+      if (document.indexingStatus !== "ready") {
+        acknowledge({
+          ok: false,
+          error: createError(
+            "DOCUMENT_NOT_READY",
+            "Document chat will be available after AI indexing is complete.",
+          ),
+        });
+        return;
+      }
+
       stopActiveResponse(socket);
       socket.data.documentId = documentId;
-      socket.data.documentChunks = document.chunks;
       socket.data.history = [];
       acknowledge({ ok: true });
     });
@@ -246,10 +319,7 @@ export function attachDocumentChatSocket(
         return;
       }
 
-      if (
-        socket.data.documentId === null ||
-        socket.data.documentChunks === null
-      ) {
+      if (socket.data.documentId === null) {
         acknowledge({
           ok: false,
           error: createError(
@@ -272,10 +342,11 @@ export function attachDocumentChatSocket(
       }
 
       acknowledge({ ok: true });
-      void streamGeminiAssistantResponse(
+      void streamAssistantResponse(
         socket,
+        documentRepository,
+        aiService,
         content,
-        socket.data.documentChunks,
       );
     });
 
@@ -298,7 +369,6 @@ export function attachDocumentChatSocket(
     socket.on("chat:session:destroy", (acknowledge) => {
       stopActiveResponse(socket);
       socket.data.documentId = null;
-      socket.data.documentChunks = null;
       socket.data.history = [];
       acknowledge({ ok: true });
     });
@@ -306,7 +376,6 @@ export function attachDocumentChatSocket(
     socket.on("disconnect", () => {
       stopActiveResponse(socket);
       socket.data.documentId = null;
-      socket.data.documentChunks = null;
       socket.data.history = [];
     });
   });

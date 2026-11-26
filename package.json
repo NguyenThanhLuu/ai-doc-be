@@ -4,6 +4,7 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
+    "db:migrate": "node --env-file=.env --import tsx src/database/run-migrations.ts",
     "dev": "node --env-file=.env --import tsx --watch src/main.ts",
     "start": "node --env-file=.env --import tsx src/main.ts",
     "typecheck": "tsc --noEmit --pretty false",
@@ -17,6 +18,7 @@
     "@nestjs/common": "^12.5.0",
     "@nestjs/core": "^12.5.0",
     "@nestjs/platform-express": "^12.5.0",
+    "@supabase/supabase-js": "^2.119.2",
     "bcrypt": "^6.0.0",
     "jose": "^6.2.18",
     "multer": "^2.5.0",

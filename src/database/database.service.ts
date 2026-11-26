@@ -36,7 +36,7 @@ export class DatabaseService implements OnModuleInit, OnApplicationShutdown {
       this.logger.log("PostgreSQL connection established.");
     } catch (error: unknown) {
       this.logger.error(
-        "PostgreSQL connection failed. Verify DATABASE_URL and Supabase network access.",
+        "PostgreSQL connection failed. Verify DATABASE_URL and database network access.",
       );
       throw error;
     }

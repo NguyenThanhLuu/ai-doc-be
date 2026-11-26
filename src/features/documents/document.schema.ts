@@ -37,6 +37,9 @@ const uploadedPdfSchema = z
   .refine(hasPdfSignature, "The selected file is not a valid PDF.");
 
 export const documentUploadSchema = z.object({
+  uploadRequestId: z
+    .string({ error: "Upload request ID is required." })
+    .uuid("Upload request ID is invalid."),
   name: z
     .string({ error: "Document name is required." })
     .trim()

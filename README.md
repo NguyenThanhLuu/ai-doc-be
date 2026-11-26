@@ -1,8 +1,10 @@
 # Node AI Pro Backend
 
-Node AI Pro is the local NestJS and TypeScript API for React AI Pro. The
-current implementation accepts PDF uploads, keeps them in process memory, and
-serves their metadata and content back to the frontend.
+Node AI Pro is the local NestJS and TypeScript API for React AI Pro. PDF files
+are stored through the document-storage adapter (currently backed by a private
+Supabase Storage bucket), while document metadata,
+indexing state, extracted chunks, and pgvector embeddings are stored in
+PostgreSQL.
 
 ## Technology
 
@@ -11,32 +13,33 @@ serves their metadata and content back to the frontend.
 - Socket.IO for document-scoped realtime chat.
 - Multer for `multipart/form-data` parsing with memory storage.
 - PostgreSQL through a shared `node-postgres` connection pool.
+- Provider-neutral document storage, currently backed by Supabase Storage.
+- pgvector for document chunk embeddings and similarity search.
 - Zod for runtime validation at HTTP boundaries.
-- Google Gen AI SDK for Gemini response streaming.
+- Provider-neutral AI service, currently backed by the Google Gen AI SDK.
 - Oxlint for static analysis.
 
 ## Current Scope
 
 The API supports:
 
-- Uploading one PDF with a user-defined document name.
-- Listing uploaded document metadata.
+- Uploading one PDF and returning before AI indexing completes.
+- Listing only the authenticated user's documents and indexing status.
 - Reading one document's metadata.
-- Streaming a stored PDF back for inline browser viewing.
+- Creating short-lived signed URLs for private PDF viewing.
 - Initializing one temporary chat context per connected PDF detail socket.
-- Validating chat message input and streaming real Gemini responses.
+- Validating chat message input and streaming AI responses.
 - Keeping a small bounded multi-turn history in socket memory.
-- Cancelling active Gemini responses and immediately cleaning up on explicit
+- Cancelling active AI responses and immediately cleaning up on explicit
   exit or socket disconnect.
 - Signing in with email and password through short-lived access JWTs.
 - Restoring authentication through a seven-day refresh JWT cookie.
 
 The authentication foundation stores users in PostgreSQL. Access and refresh
 tokens are stateless and are signed with separate secrets.
-Existing document metadata, PDF content, extracted text, embeddings, and chat
-history remain in memory. Role-protected user management and authorization for
-document HTTP and Socket.IO access remain planned in
-[`docs/auth-roadmap.md`](docs/auth-roadmap.md).
+Document ownership is enforced for HTTP and Socket.IO access. PDF files,
+metadata, chunks, embeddings, and retry state survive backend restarts. Chat
+history remains intentionally temporary in socket memory.
 
 ## Project Structure
 
@@ -44,6 +47,9 @@ document HTTP and Socket.IO access remain planned in
 src/
 |-- app.module.ts
 |-- main.ts
+|-- ai/
+|   |-- ai.module.ts
+|   `-- ai.service.ts
 |-- config/
 |   `-- environment.ts
 |-- database/
@@ -59,15 +65,14 @@ src/
 |   |   `-- authentication.types.ts
 |   |-- document-chat/
 |   |   |-- document-chat.socket.ts
-|   |   |-- document-chat.types.ts
-|   |   `-- gemini-generation.ts
+|   |   `-- document-chat.types.ts
 |   `-- documents/
 |       |-- documents.module.ts
 |       |-- documents.controller.ts
 |       |-- documents.service.ts
 |       |-- document.schema.ts
 |       |-- document.repository.ts
-|       |-- memory-document.repository.ts
+|       |-- document-indexing.worker.ts
 |       `-- document.types.ts
 |-- http/
 |   |-- api-http.exception.ts
@@ -79,7 +84,13 @@ src/
 `main.ts` creates the Nest application, attaches Socket.IO to Nest's HTTP
 server, and opens the local port. `AppModule` composes feature modules and the
 shared API error filter. Each feature owns its controller, service, validation,
-contracts, and in-memory state when needed.
+and contracts.
+
+`DocumentsService`, the indexing worker, and the chat socket use the concrete
+`DocumentRepository` directly; there is no repository token or duplicate
+PostgreSQL implementation class. Vendor-specific SDK calls are isolated behind
+the provider-neutral `AiService` and `DocumentStorageService`, so changing an
+AI or storage provider does not change document business code.
 
 ## API Contract
 
@@ -92,25 +103,57 @@ cookie and returns a new access token with the current user. `GET /api/auth/me`
 accepts the access token as a Bearer token. `POST /api/auth/logout` clears the
 refresh-token cookie.
 
+Email matching is case-sensitive. The API stores the exact valid email value
+provided during account creation and requires the same casing at sign-in.
+
+An application-wide access-token guard protects every HTTP controller route by
+default. Login, refresh, and logout are explicitly public. Protected requests
+must provide `Authorization: Bearer <access-token>`.
+
+### Account management
+
+All account-management endpoints require a Bearer access token:
+
+- `GET /api/users` returns all safe account summaries and is restricted to
+  administrators.
+- `POST /api/users` creates an `admin` or `user` account and is restricted to
+  administrators.
+- `PATCH /api/users/me/username` updates only the authenticated user's
+  username and returns a replacement access token that preserves the original
+  access token's expiration time.
+- `PATCH /api/users/me/password` verifies the current password, stores a new
+  bcrypt hash, and clears the refresh-token cookie so the user must sign in
+  again.
+
+Run `npm run db:migrate` to apply pending PostgreSQL migrations. The migration
+runner records completed SQL files in `public.schema_migrations` and applies
+each pending file transactionally.
+
 ### Create a document
 
 `POST /api/documents` accepts `multipart/form-data` with:
 
 - `name`: required custom document name, at most 120 characters.
 - `file`: required PDF, at most 10 MB.
+- `uploadRequestId`: required UUID used to make retries idempotent.
 
-The server validates the text field, Multer file structure, MIME type, size,
-and `%PDF-` file signature. A successful request returns `201`:
+All document endpoints require a valid Bearer access token, including PDF
+content responses.
+
+The server validates the fields, Multer file structure, MIME type, size, and
+`%PDF-` signature. A durable upload returns `202` while AI indexing continues:
 
 ```json
 {
-  "message": "Document added successfully.",
+  "message": "PDF uploaded successfully. AI indexing is running in the background.",
   "document": {
     "id": "generated UUID",
     "name": "Research notes",
     "originalFileName": "source.pdf",
     "mimeType": "application/pdf",
     "size": 12345,
+    "indexingStatus": "processing",
+    "indexingError": null,
     "createdAt": "ISO-8601 timestamp"
   }
 }
@@ -118,8 +161,8 @@ and `%PDF-` file signature. A successful request returns `201`:
 
 ### List documents
 
-`GET /api/documents` returns `{ "documents": [...] }` ordered newest first.
-File buffers are never included in this response.
+`GET /api/documents` returns only the authenticated user's documents ordered
+newest first. File buffers and Storage paths are never included.
 
 ### Read document metadata
 
@@ -127,8 +170,12 @@ File buffers are never included in this response.
 
 ### Read PDF content
 
-`GET /api/documents/:documentId/content` returns the stored buffer with
-`Content-Type: application/pdf` and inline content disposition.
+`GET /api/documents/:documentId/content-url` returns a short-lived signed URL
+after checking ownership. The compatibility `/content` endpoint redirects to a
+fresh signed URL.
+
+`POST /api/documents/:documentId/indexing/retry` queues a failed document for
+indexing again without uploading the PDF again.
 
 ### Error shape
 
@@ -143,25 +190,23 @@ All handled API failures use:
 }
 ```
 
-## In-Memory Storage
+## Durable Document Storage and Indexing
 
-Documents are stored by `MemoryDocumentRepository` in a process-local `Map`.
-Each entry contains metadata, the complete PDF `Buffer`, and its generated
-document chunks. All documents are lost whenever the backend stops or restarts.
-The 10 MB request limit reduces individual upload risk, but this storage design
-is for local incremental development only and is not suitable for production or
-multiple server instances.
+The upload request temporarily holds at most one 10 MB PDF buffer, writes it to
+private document storage, then creates a PostgreSQL `documents` row with
+`indexing_status = 'processing'`. The document row itself acts as the durable
+queue, so a separate jobs table is not required.
 
-HTTP controllers and Socket.IO depend on the `DocumentRepository` contract, not
-directly on the in-memory `Map`. A future implementation can replace the Nest
-provider with a PostgreSQL repository using `pg` for metadata/chunks and a
-Supabase Storage bucket for PDF content. No PostgreSQL or Supabase dependency,
-configuration, schema, or network call is included while persistence is not
-needed. Chat history remains temporary socket memory.
+The background worker claims one processing document, downloads its PDF,
+extracts text, creates AI embeddings, stores the results in
+`document_chunks`, and marks the document `ready`. Transient failures receive
+up to three total attempts; permanent or exhausted failures become `failed`.
+Expired worker locks let processing resume after a backend restart. Chat
+history remains temporary socket memory.
 
 ## Ephemeral Document Chat
 
-Socket.IO streams real Gemini text deltas while preserving the Phase 1 event
+Socket.IO streams real AI text deltas while preserving the Phase 1 event
 contract. Each successful PDF detail-page mount opens one socket, and that
 socket is the temporary chat context for the current document.
 
@@ -169,7 +214,7 @@ socket is the temporary chat context for the current document.
 - Closing and reopening the chat Drawer does not affect the socket.
 - Leaving, refreshing, or closing the detail page permanently deletes its chat
   history. Visible messages exist in frontend React state, and the bounded
-  Gemini conversation context exists only on `socket.data`.
+  AI conversation context exists only on `socket.data`.
 - A disconnect immediately cancels the active response and clears the socket
   context. A reconnect initializes the document context again but does not
   resume an interrupted response.
@@ -214,26 +259,33 @@ reserved characters in the database password before placing it in the URL.
 DATABASE_URL=postgresql://postgres.YOUR_PROJECT_REF:YOUR_URL_ENCODED_DATABASE_PASSWORD@YOUR_SESSION_POOLER_HOST:5432/postgres?sslmode=require
 ACCESS_TOKEN_SECRET=replace-with-a-random-secret-of-at-least-32-bytes
 REFRESH_TOKEN_SECRET=replace-with-a-different-random-secret-of-at-least-32-bytes
-GEMINI_API_KEY=your-api-key
-GEMINI_MODEL=gemini-3.1-flash-lite
-GEMINI_EMBEDDING_MODEL=gemini-embedding-001
+STORAGE_URL=https://YOUR_PROJECT_REF.supabase.co
+STORAGE_SECRET_KEY=sb_secret_REPLACE_WITH_YOUR_SECRET_KEY
+DOCUMENT_STORAGE_BUCKET=documents
+DOCUMENT_STORAGE_SIGNED_URL_TTL_SECONDS=600
+AI_API_KEY=your-ai-provider-api-key
+AI_CHAT_MODEL=gemini-3.1-flash-lite
+AI_EMBEDDING_MODEL=gemini-embedding-001
 FRONTEND_ORIGIN=http://localhost:5173
 ```
 
-`DATABASE_URL`, `ACCESS_TOKEN_SECRET`, `REFRESH_TOKEN_SECRET`, and
-`GEMINI_API_KEY` are required. The token secrets must differ and contain at
-least 32 bytes. `GEMINI_MODEL` and `GEMINI_EMBEDDING_MODEL` have the defaults
-shown above. Both `npm run dev` and
+`DATABASE_URL`, `ACCESS_TOKEN_SECRET`, `REFRESH_TOKEN_SECRET`, `STORAGE_URL`,
+`STORAGE_SECRET_KEY`, and `AI_API_KEY` are required. Storage credentials must
+remain backend-only. The token secrets must differ and contain at least 32
+bytes. `AI_CHAT_MODEL`, `AI_EMBEDDING_MODEL`, the bucket name, and signed URL
+TTL use the values shown above. Legacy `SUPABASE_*` and `GEMINI_*` names remain
+accepted during migration. Both `npm run dev` and
 `npm run start` load `.env` through Node's built-in `--env-file` option. The
 file is ignored by Git and must never be committed.
 
-Nest verifies the database connection during startup and stops initialization
-when the URL is missing, SSL is not required, or Supabase cannot be reached.
-The connection pool is shared application-wide and closes through Nest's
-shutdown lifecycle. Supabase API keys are not needed for this server-side
-PostgreSQL connection.
+The database migration creates a private Storage bucket named `documents`,
+restricts it to `application/pdf`, and sets its maximum size to 10 MB. Copy the
+project URL and a backend Secret key into `.env`. If you choose a different
+bucket name, create that private bucket manually with the same restrictions.
+Nest verifies the database connection and bucket during startup and fails fast
+when either is unavailable or misconfigured.
 
-The backend limits Gemini responses to 1,000 output tokens, disables automatic
+The backend limits AI responses to 1,000 output tokens, disables automatic
 continuation, and never sends provider error details or credentials to the
 frontend.
 
@@ -262,9 +314,9 @@ FRONTEND_ORIGIN=https://app.your-domain.com
 ```
 
 Only that exact origin receives the REST CORS response headers. The middleware
-allows the current `GET`, `POST`, and `OPTIONS` methods plus the `Accept` and
-`Content-Type` request headers. Socket.IO uses the same origin value for its
-polling handshake and connection configuration.
+allows `GET`, `POST`, `PUT`, `PATCH`, and `OPTIONS` plus the `Accept`,
+`Authorization`, and `Content-Type` request headers. Socket.IO uses the same
+origin value for its polling handshake and connection configuration.
 
 ## Accessibility
 
@@ -280,6 +332,13 @@ handshake. Live Gemini indexing and response generation require a configured
 API credential and external provider access.
 
 ## Change History
+
+### 2026-11-24
+
+- Replaced process-memory document storage with PostgreSQL metadata/chunks and
+  private Supabase Storage PDF objects.
+- Added durable background indexing state, three-attempt retry, pgvector
+  evidence retrieval, signed PDF URLs, and per-user HTTP/Socket.IO ownership.
 
 ### 2026-10-25
 
