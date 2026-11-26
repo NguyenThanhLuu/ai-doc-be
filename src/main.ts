@@ -8,7 +8,8 @@ import { AuthenticationService } from "./features/authentication/authentication.
 import { DocumentRepository } from "./features/documents/document.repository.js";
 import { corsMiddleware } from "./middleware/cors-middleware.js";
 
-const PORT = 3000;
+const HOST = "0.0.0.0";
+const PORT = Number(process.env.PORT?.trim() || "3000");
 
 async function bootstrap(): Promise<void> {
   const app = await NestFactory.create<NestExpressApplication>(AppModule);
@@ -29,8 +30,8 @@ async function bootstrap(): Promise<void> {
     aiService,
   );
 
-  await app.listen(PORT);
-  console.log(`Node AI Pro API is listening on http://localhost:${PORT}`);
+  await app.listen(PORT, HOST);
+  console.log(`Node AI Pro API is listening on http://${HOST}:${PORT}`);
 }
 
 await bootstrap();

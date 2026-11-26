@@ -4,9 +4,9 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
-    "db:migrate": "node --env-file=.env --import tsx src/database/run-migrations.ts",
+    "db:migrate": "node --env-file-if-exists=.env --import tsx src/database/run-migrations.ts",
     "dev": "node --env-file=.env --import tsx --watch src/main.ts",
-    "start": "node --env-file=.env --import tsx src/main.ts",
+    "start": "node --env-file-if-exists=.env --import tsx src/main.ts",
     "typecheck": "tsc --noEmit --pretty false",
     "lint": "oxlint src"
   },

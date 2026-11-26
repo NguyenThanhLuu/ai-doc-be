@@ -274,9 +274,10 @@ FRONTEND_ORIGIN=http://localhost:5173
 remain backend-only. The token secrets must differ and contain at least 32
 bytes. `AI_CHAT_MODEL`, `AI_EMBEDDING_MODEL`, the bucket name, and signed URL
 TTL use the values shown above. Legacy `SUPABASE_*` and `GEMINI_*` names remain
-accepted during migration. Both `npm run dev` and
-`npm run start` load `.env` through Node's built-in `--env-file` option. The
-file is ignored by Git and must never be committed.
+accepted during migration. `npm run dev` requires the local `.env` file, while
+`npm run start` and `npm run db:migrate` load it only when present so hosted
+environments can inject variables directly. The file is ignored by Git and
+must never be committed.
 
 The database migration creates a private Storage bucket named `documents`,
 restricts it to `application/pdf`, and sets its maximum size to 10 MB. Copy the
