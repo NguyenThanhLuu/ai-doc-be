@@ -100,7 +100,7 @@ async function extractPdfTextChunks(
         if (chunks.length > MAX_DOCUMENT_CHUNKS) {
           throw new DocumentIndexingError(
             "PDF_INDEX_TOO_LARGE",
-            "The PDF contains too much text for this demo. Try a smaller document.",
+            "The PDF contains too much text to process. Try a smaller document.",
             422,
           );
         }

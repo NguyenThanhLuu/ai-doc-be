@@ -8,6 +8,8 @@ import {
   type DocumentEvidence,
   type DocumentIndexingStatus,
   type DocumentMetadata,
+  type PaginatedDocuments,
+  type ReplaceDocumentFileInput,
   type DocumentRecord,
 } from "./document.types.js";
 
@@ -38,6 +40,10 @@ interface DocumentRow extends QueryResultRow {
 interface EvidenceRow extends QueryResultRow {
   readonly pageNumber: number;
   readonly text: string;
+}
+
+interface DocumentCountRow extends QueryResultRow {
+  readonly totalItems: string;
 }
 
 function toMetadata(row: DocumentRow): DocumentMetadata {
@@ -193,18 +199,142 @@ export class DocumentRepository {
     return document ? toMetadata(document) : null;
   }
 
-  async listByUserId(userId: string): Promise<readonly DocumentMetadata[]> {
+  async listPageByUserId(
+    userId: string,
+    page: number,
+    pageSize: number,
+  ): Promise<PaginatedDocuments> {
+    const offset = (page - 1) * pageSize;
+    const [documentsResult, countResult] = await Promise.all([
+      this.databaseService.pool.query<DocumentRow>(
+        `
+          SELECT ${DOCUMENT_COLUMNS}
+          FROM documents
+          WHERE user_id = $1
+          ORDER BY created_at DESC, id DESC
+          LIMIT $2 OFFSET $3
+        `,
+        [userId, pageSize, offset],
+      ),
+      this.databaseService.pool.query<DocumentCountRow>(
+        `
+          SELECT COUNT(*)::text AS "totalItems"
+          FROM documents
+          WHERE user_id = $1
+        `,
+        [userId],
+      ),
+    ]);
+    const totalItems = Number(countResult.rows[0]?.totalItems ?? 0);
+
+    if (!Number.isSafeInteger(totalItems) || totalItems < 0) {
+      throw new Error("PostgreSQL returned an invalid document count.");
+    }
+
+    return {
+      documents: documentsResult.rows.map(toMetadata),
+      pagination: {
+        page,
+        pageSize,
+        totalItems,
+        totalPages: Math.ceil(totalItems / pageSize),
+      },
+    };
+  }
+
+  async updateName(
+    documentId: string,
+    userId: string,
+    name: string,
+  ): Promise<DocumentMetadata | null> {
     const result = await this.databaseService.pool.query<DocumentRow>(
       `
-        SELECT ${DOCUMENT_COLUMNS}
-        FROM documents
-        WHERE user_id = $1
-        ORDER BY created_at DESC, id DESC
+        UPDATE documents
+        SET name = $3, updated_at = NOW()
+        WHERE id = $1 AND user_id = $2
+        RETURNING ${DOCUMENT_COLUMNS}
       `,
-      [userId],
+      [documentId, userId, name],
     );
+    const document = result.rows[0];
+    return document ? toMetadata(document) : null;
+  }
 
-    return result.rows.map(toMetadata);
+  async replaceFile(
+    input: ReplaceDocumentFileInput,
+  ): Promise<DocumentMetadata | null> {
+    const client = await this.databaseService.pool.connect();
+
+    try {
+      await client.query("BEGIN");
+      const result = await client.query<DocumentRow>(
+        `
+          UPDATE documents
+          SET
+            name = $3,
+            original_file_name = $4,
+            size_bytes = $5,
+            storage_bucket = $6,
+            storage_object_path = $7,
+            indexing_status = 'processing',
+            indexing_attempts = 0,
+            next_index_at = NOW(),
+            indexing_locked_by = NULL,
+            indexing_locked_until = NULL,
+            indexing_error_code = NULL,
+            embedding_model = NULL,
+            indexed_at = NULL,
+            updated_at = NOW()
+          WHERE id = $1
+            AND user_id = $2
+            AND storage_object_path = $8
+          RETURNING ${DOCUMENT_COLUMNS}
+        `,
+        [
+          input.documentId,
+          input.userId,
+          input.name,
+          input.originalFileName,
+          input.size,
+          input.storageBucket,
+          input.storageObjectPath,
+          input.expectedStorageObjectPath,
+        ],
+      );
+      const document = result.rows[0];
+
+      if (!document) {
+        await client.query("ROLLBACK");
+        return null;
+      }
+
+      await client.query("DELETE FROM document_chunks WHERE document_id = $1", [
+        input.documentId,
+      ]);
+      await client.query("COMMIT");
+      return toMetadata(document);
+    } catch (error: unknown) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  async deleteByIdForUser(
+    documentId: string,
+    userId: string,
+  ): Promise<DocumentRecord | null> {
+    const result = await this.databaseService.pool.query<DocumentRow>(
+      `
+        DELETE FROM documents
+        WHERE id = $1 AND user_id = $2
+        RETURNING ${DOCUMENT_COLUMNS}
+      `,
+      [documentId, userId],
+    );
+    const document = result.rows[0];
+    return document ? toRecord(document) : null;
   }
 
   async claimNextForIndexing(
@@ -245,6 +375,7 @@ export class DocumentRepository {
 
   async completeIndexing(
     documentId: string,
+    storageObjectPath: string,
     chunks: readonly DocumentChunk[],
     embeddingModel: string,
   ): Promise<void> {
@@ -277,12 +408,12 @@ export class DocumentRepository {
             indexing_error_code = NULL,
             indexing_locked_by = NULL,
             indexing_locked_until = NULL,
-            embedding_model = $2,
+            embedding_model = $3,
             indexed_at = NOW(),
             updated_at = NOW()
-          WHERE id = $1
+          WHERE id = $1 AND storage_object_path = $2
         `,
-        [documentId, embeddingModel],
+        [documentId, storageObjectPath, embeddingModel],
       );
 
       if (updateResult.rowCount !== 1) {
@@ -300,6 +431,7 @@ export class DocumentRepository {
 
   async recordIndexingFailure(
     documentId: string,
+    storageObjectPath: string,
     status: Extract<DocumentIndexingStatus, "failed" | "processing">,
     errorCode: string,
     nextIndexAt: Date,
@@ -308,15 +440,15 @@ export class DocumentRepository {
       `
         UPDATE documents
         SET
-          indexing_status = $2,
-          indexing_error_code = $3,
-          next_index_at = $4,
+          indexing_status = $3,
+          indexing_error_code = $4,
+          next_index_at = $5,
           indexing_locked_by = NULL,
           indexing_locked_until = NULL,
           updated_at = NOW()
-        WHERE id = $1
+        WHERE id = $1 AND storage_object_path = $2
       `,
-      [documentId, status, errorCode, nextIndexAt],
+      [documentId, storageObjectPath, status, errorCode, nextIndexAt],
     );
   }
 

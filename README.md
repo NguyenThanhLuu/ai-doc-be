@@ -161,8 +161,23 @@ The server validates the fields, Multer file structure, MIME type, size, and
 
 ### List documents
 
-`GET /api/documents` returns only the authenticated user's documents ordered
-newest first. File buffers and Storage paths are never included.
+`GET /api/documents?page=1&pageSize=10` returns only the authenticated user's
+documents ordered newest first. Supported page sizes are 10, 20, 50, and 100.
+The response includes `page`, `pageSize`, `totalItems`, and `totalPages`. File
+buffers and Storage paths are never included.
+
+### Update a document
+
+`PATCH /api/documents/:documentId` accepts multipart data containing a required
+`name` and an optional `file`. A name-only update preserves the current index.
+A replacement PDF receives the same validation as an upload, moves the document
+to `processing`, deletes old chunks, and queues the replacement for indexing.
+
+### Delete a document
+
+`DELETE /api/documents/:documentId` deletes the owned document. PostgreSQL
+cascades deletion to `document_chunks`, and the service removes the private PDF
+object from document storage.
 
 ### Read document metadata
 
@@ -203,6 +218,10 @@ extracts text, creates AI embeddings, stores the results in
 up to three total attempts; permanent or exhausted failures become `failed`.
 Expired worker locks let processing resume after a backend restart. Chat
 history remains temporary socket memory.
+
+PDF replacement uses a new private Storage object path. Index completion and
+failure updates include the claimed path, so a worker still processing an old
+PDF cannot overwrite the state or chunks of its replacement.
 
 ## Ephemeral Document Chat
 
@@ -333,6 +352,12 @@ handshake. Live Gemini indexing and response generation require a configured
 API credential and external provider access.
 
 ## Change History
+
+### 2026-11-27
+
+- Added authenticated document rename, optional PDF replacement, and deletion.
+- Added user-scoped database pagination with page sizes 10, 20, 50, and 100.
+- Prevented stale indexing workers from completing against a replaced PDF.
 
 ### 2026-11-24
 

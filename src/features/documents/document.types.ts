@@ -16,6 +16,18 @@ export interface DocumentMetadata {
   readonly createdAt: string;
 }
 
+export interface DocumentPagination {
+  readonly page: number;
+  readonly pageSize: number;
+  readonly totalItems: number;
+  readonly totalPages: number;
+}
+
+export interface PaginatedDocuments {
+  readonly documents: readonly DocumentMetadata[];
+  readonly pagination: DocumentPagination;
+}
+
 export interface DocumentChunk {
   readonly pageNumber: number;
   readonly text: string;
@@ -38,6 +50,17 @@ export interface CreateProcessingDocumentInput {
   readonly id: string;
   readonly userId: string;
   readonly uploadRequestId: string;
+  readonly name: string;
+  readonly originalFileName: string;
+  readonly size: number;
+  readonly storageBucket: string;
+  readonly storageObjectPath: string;
+}
+
+export interface ReplaceDocumentFileInput {
+  readonly documentId: string;
+  readonly userId: string;
+  readonly expectedStorageObjectPath: string;
   readonly name: string;
   readonly originalFileName: string;
   readonly size: number;

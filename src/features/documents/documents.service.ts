@@ -10,13 +10,22 @@ import {
   DocumentRepository,
   DuplicateDocumentUploadError,
 } from "./document.repository.js";
-import type { DocumentMetadata, DocumentRecord } from "./document.types.js";
+import type {
+  DocumentMetadata,
+  DocumentRecord,
+  PaginatedDocuments,
+} from "./document.types.js";
 
 interface CreateDocumentInput {
   readonly file: Express.Multer.File;
   readonly name: string;
   readonly uploadRequestId: string;
   readonly userId: string;
+}
+
+interface UpdateDocumentInput {
+  readonly file: Express.Multer.File | undefined;
+  readonly name: string;
 }
 
 @Injectable()
@@ -66,7 +75,11 @@ export class DocumentsService {
         storageObjectPath,
       });
     } catch (error: unknown) {
-      await this.removeUploadedPdf(storageBucket, storageObjectPath);
+      await this.removeStoredPdf(
+        storageBucket,
+        storageObjectPath,
+        "Failed to remove an orphaned uploaded PDF.",
+      );
 
       if (error instanceof DuplicateDocumentUploadError) {
         const duplicateDocument =
@@ -88,8 +101,98 @@ export class DocumentsService {
     return this.documentRepository.findByIdForUser(documentId, userId);
   }
 
-  list(userId: string): Promise<readonly DocumentMetadata[]> {
-    return this.documentRepository.listByUserId(userId);
+  list(
+    userId: string,
+    page: number,
+    pageSize: number,
+  ): Promise<PaginatedDocuments> {
+    return this.documentRepository.listPageByUserId(userId, page, pageSize);
+  }
+
+  async update(
+    document: DocumentRecord,
+    input: UpdateDocumentInput,
+  ): Promise<DocumentMetadata> {
+    if (!input.file) {
+      const updatedDocument = await this.documentRepository.updateName(
+        document.id,
+        document.userId,
+        input.name,
+      );
+
+      if (!updatedDocument) {
+        this.throwDocumentNotFound();
+      }
+
+      return updatedDocument;
+    }
+
+    const storageBucket = this.storageService.documentsBucket;
+    const storageObjectPath = `${document.userId}/${document.id}/${randomUUID()}.pdf`;
+
+    try {
+      await this.storageService.uploadPdf(
+        storageObjectPath,
+        input.file.buffer,
+      );
+    } catch (error: unknown) {
+      this.throwStorageError(error, "DOCUMENT_STORAGE_UPLOAD_FAILED");
+    }
+
+    let updatedDocument: DocumentMetadata | null;
+
+    try {
+      updatedDocument = await this.documentRepository.replaceFile({
+        documentId: document.id,
+        userId: document.userId,
+        expectedStorageObjectPath: document.storageObjectPath,
+        name: input.name,
+        originalFileName: input.file.originalname,
+        size: input.file.size,
+        storageBucket,
+        storageObjectPath,
+      });
+    } catch (error: unknown) {
+      await this.removeStoredPdf(
+        storageBucket,
+        storageObjectPath,
+        "Failed to remove an orphaned replacement PDF.",
+      );
+      throw error;
+    }
+
+    if (!updatedDocument) {
+      await this.removeStoredPdf(
+        storageBucket,
+        storageObjectPath,
+        "Failed to remove an orphaned replacement PDF.",
+      );
+      this.throwDocumentNotFound();
+    }
+
+    await this.removeStoredPdf(
+      document.storageBucket,
+      document.storageObjectPath,
+      "Failed to remove the replaced PDF.",
+    );
+    return updatedDocument;
+  }
+
+  async delete(document: DocumentRecord): Promise<void> {
+    const deletedDocument = await this.documentRepository.deleteByIdForUser(
+      document.id,
+      document.userId,
+    );
+
+    if (!deletedDocument) {
+      this.throwDocumentNotFound();
+    }
+
+    await this.removeStoredPdf(
+      deletedDocument.storageBucket,
+      deletedDocument.storageObjectPath,
+      "Failed to remove the deleted document PDF.",
+    );
   }
 
   async createSignedContentUrl(
@@ -130,20 +233,29 @@ export class DocumentsService {
     return retriedDocument;
   }
 
-  private async removeUploadedPdf(
+  private async removeStoredPdf(
     bucket: string,
     objectPath: string,
+    failureMessage: string,
   ): Promise<void> {
     try {
       await this.storageService.removePdf(bucket, objectPath);
     } catch (error: unknown) {
-      this.logger.error("Failed to remove an orphaned uploaded PDF.", {
+      this.logger.error(failureMessage, {
         bucket,
         objectPath,
         storageCode:
           error instanceof DocumentStorageError ? error.storageCode : undefined,
       });
     }
+  }
+
+  private throwDocumentNotFound(): never {
+    throw new ApiHttpException(
+      HttpStatus.NOT_FOUND,
+      "DOCUMENT_NOT_FOUND",
+      "The requested document could not be found.",
+    );
   }
 
   private throwStorageError(error: unknown, code: string): never {

@@ -112,6 +112,7 @@ export class DocumentIndexingWorker
 
       await this.documentRepository.completeIndexing(
         document.id,
+        document.storageObjectPath,
         chunks,
         this.aiService.embeddingModel,
       );
@@ -143,6 +144,7 @@ export class DocumentIndexingWorker
 
     await this.documentRepository.recordIndexingFailure(
       document.id,
+      document.storageObjectPath,
       isFinalFailure ? "failed" : "processing",
       failure.code,
       new Date(Date.now() + (isFinalFailure ? 0 : retryDelay)),

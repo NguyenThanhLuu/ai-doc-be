@@ -1,13 +1,16 @@
 import {
   Body,
   Controller,
+  Delete,
   Get,
   Header,
   HttpCode,
   HttpStatus,
   Inject,
   Param,
+  Patch,
   Post,
+  Query,
   Res,
   UploadedFile,
   UseInterceptors,
@@ -20,10 +23,16 @@ import { CurrentUser } from "../authentication/current-user.decorator.js";
 import type { AuthenticatedPrincipal } from "../authentication/authentication.types.js";
 import {
   documentIdSchema,
+  documentListQuerySchema,
+  documentUpdateSchema,
   documentUploadSchema,
   MAX_PDF_SIZE_BYTES,
 } from "./document.schema.js";
-import type { DocumentMetadata, DocumentRecord } from "./document.types.js";
+import type {
+  DocumentMetadata,
+  DocumentRecord,
+  PaginatedDocuments,
+} from "./document.types.js";
 import { DocumentsService } from "./documents.service.js";
 
 interface CreateDocumentResponse {
@@ -35,13 +44,14 @@ interface DocumentMetadataResponse {
   readonly document: DocumentMetadata;
 }
 
-interface DocumentListResponse {
-  readonly documents: readonly DocumentMetadata[];
-}
-
 interface DocumentContentUrlResponse {
   readonly expiresAt: string;
   readonly url: string;
+}
+
+interface DeleteDocumentResponse {
+  readonly documentId: string;
+  readonly message: string;
 }
 
 function readBodyField(body: unknown, fieldName: string): unknown {
@@ -118,9 +128,95 @@ export class DocumentsController {
   @Get()
   @Header("Cache-Control", "no-store")
   async list(
+    @Query() query: unknown,
     @CurrentUser() currentUser: AuthenticatedPrincipal,
-  ): Promise<DocumentListResponse> {
-    return { documents: await this.documentsService.list(currentUser.id) };
+  ): Promise<PaginatedDocuments> {
+    const validationResult = documentListQuerySchema.safeParse({
+      page: readBodyField(query, "page"),
+      pageSize: readBodyField(query, "pageSize"),
+    });
+
+    if (!validationResult.success) {
+      throw new ApiHttpException(
+        HttpStatus.BAD_REQUEST,
+        "DOCUMENT_PAGINATION_INVALID",
+        validationResult.error.issues[0]?.message ??
+          "Check the pagination values and try again.",
+      );
+    }
+
+    return this.documentsService.list(
+      currentUser.id,
+      validationResult.data.page,
+      validationResult.data.pageSize,
+    );
+  }
+
+  @Patch(":documentId")
+  @UseInterceptors(
+    FileInterceptor("file", {
+      storage: multer.memoryStorage(),
+      limits: {
+        files: 1,
+        fileSize: MAX_PDF_SIZE_BYTES,
+      },
+    }),
+  )
+  async update(
+    @Param("documentId") documentId: string,
+    @Body() body: unknown,
+    @UploadedFile() file: Express.Multer.File | undefined,
+    @CurrentUser() currentUser: AuthenticatedPrincipal,
+  ): Promise<CreateDocumentResponse> {
+    const document = await this.findValidatedDocument(
+      documentId,
+      currentUser.id,
+    );
+    const validationResult = documentUpdateSchema.safeParse({
+      name: readBodyField(body, "name"),
+      file,
+    });
+
+    if (!validationResult.success) {
+      throw new ApiHttpException(
+        HttpStatus.BAD_REQUEST,
+        "DOCUMENT_VALIDATION_FAILED",
+        validationResult.error.issues[0]?.message ??
+          "Check the document details and try again.",
+      );
+    }
+
+    const updatedDocument = await this.documentsService.update(
+      document,
+      {
+        name: validationResult.data.name,
+        file: validationResult.data.file,
+      },
+    );
+
+    return {
+      message: file
+        ? "Document updated successfully. AI indexing is running for the replacement PDF."
+        : "Document name updated successfully.",
+      document: updatedDocument,
+    };
+  }
+
+  @Delete(":documentId")
+  async delete(
+    @Param("documentId") documentId: string,
+    @CurrentUser() currentUser: AuthenticatedPrincipal,
+  ): Promise<DeleteDocumentResponse> {
+    const document = await this.findValidatedDocument(
+      documentId,
+      currentUser.id,
+    );
+    await this.documentsService.delete(document);
+
+    return {
+      documentId: document.id,
+      message: "Document deleted successfully.",
+    };
   }
 
   @Get(":documentId/content-url")
